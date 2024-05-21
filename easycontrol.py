@@ -80,7 +80,7 @@ class Easycontrol:
         if(channel == None):
             channel = 0
         channel = int(channel)
-        self.selected = None
+        self.selected = self.check_channel()
         print(f"select channel: {channel}")
         i=0
         while( ( self.selected != channel ) and (i < 10) ):
