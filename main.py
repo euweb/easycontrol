@@ -1,29 +1,19 @@
 import machine
+import time
 import ubinascii
 import ure as re
 from umqtt.simple import MQTTClient
 from easycontrol import Easycontrol
-#import easycontrol
+from machine import Timer
 
-CONFIG = {
-    "broker": "192.168.1.16",
-    "sensor_pin": 0,
-    "client_id": b"esp8266_" + ubinascii.hexlify(machine.unique_id()),
-    "topic": b"easycontrol",
-    "select_pin": 21, 
-    "up_pin": 0,
-    "down_pin": 0,
-    "stop_pin": 0,
-    "ch1_pin": 0,
-    "ch2_pin": 0,
-    "ch3_pin": 0,
-    "ch4_pin": 0,
-    "ch5_pin": 0,
-}
+
+CONFIG = {}
 
 HA_CONFIG = {}
+MQTT_CONFIG = {}
 
 ec = None
+client = None
 
 def load_config():
     import ujson as json
@@ -32,18 +22,9 @@ def load_config():
             config = json.loads(f.read())
     except (OSError, ValueError):
         print("Couldn't load /config.json")
-        save_config()
     else:
         CONFIG.update(config)
         print("Loaded config from /config.json")
-
-def save_config():
-    import ujson as json
-    try:
-        with open("/config.json", "w") as f:
-            f.write(json.dumps(CONFIG))
-    except OSError:
-        print("Couldn't save /config.json")
 
 def parse_string(s):
     pattern = r'^(.*?)(?:/(\d+))?/([^/]+)$'
@@ -79,8 +60,14 @@ def sub_cb(topic_raw, msg_raw):
       ec.stop(id)
 
 
+def send_heartbeat(t):
+    global MQTT_CONFIG, HA_CONFIG, client
+    print("publish availability message")
+    client.publish(MQTT_CONFIG['basic_topic']+"/" + HA_CONFIG['availability_topic'], HA_CONFIG['payload_available'], qos=1)
+
+
 def main():
-    global ec, HA_CONFIG
+    global ec, MQTT_CONFIG, HA_CONFIG, client
     ec = Easycontrol(CONFIG["easycontrol"])
     ec.init()
     MQTT_CONFIG = CONFIG['mqtt']
@@ -91,24 +78,23 @@ def main():
     
     client.set_callback(sub_cb)
     client.connect()
-    print("publish availability message")
-    client.publish(MQTT_CONFIG['basic_topic']+"/" + HA_CONFIG['availability_topic'], HA_CONFIG['payload_available'], qos=1)
+
     
     print("subscribe to topic")
     client.subscribe(MQTT_CONFIG['basic_topic']+"/#")
-    
-    while True:
-        if True:
-            # Blocking wait for message
-            client.wait_msg()
-        else:
-            # Non-blocking wait for message
-            client.check_msg()
-            # Then need to sleep to avoid 100% CPU usage (in a real
-            # app other useful actions would be performed instead)
-            time.sleep(1)
 
-    c.disconnect()
+    send_heartbeat(None)    
+    tim1 = Timer(1)
+    tim1.init(period=60000, mode=Timer.PERIODIC, callback=send_heartbeat)
+    
+    try:
+        while 1:
+            # micropython.mem_info()
+            client.check_msg()
+            time.sleep(1)
+    finally:
+        client.disconnect()
+
 
 if __name__ == '__main__':
     load_config()
