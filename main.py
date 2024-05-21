@@ -1,8 +1,9 @@
 import machine
-from machine import Pin
-import time
 import ubinascii
+import ure as re
 from umqtt.simple import MQTTClient
+from easycontrol import Easycontrol
+#import easycontrol
 
 CONFIG = {
     "broker": "192.168.1.16",
@@ -20,21 +21,9 @@ CONFIG = {
     "ch5_pin": 0,
 }
 
-# 0 if all channels selected, greater than 0 otherwise
-selected = None
+HA_CONFIG = {}
 
-up_pin = None
-down_pin = None
-stop_pin = None
-select_pin = None
-
-ch1_pin = None
-ch2_pin = None
-ch3_pin = None
-ch4_pin = None
-ch5_pin = None
-
-ch_map = {}
+ec = None
 
 def load_config():
     import ujson as json
@@ -56,73 +45,58 @@ def save_config():
     except OSError:
         print("Couldn't save /config.json")
 
-def channel_on(pin):
-  global selected, ch_map
-  if((selected is not None) and (selected > 0)):
-    selected = 0
-  else:
-    selected = ch_map.get(pin)
-  print(f"Pin: {pin} Selected: {selected}")
+def parse_string(s):
+    pattern = r'^(.*?)(?:/(\d+))?/([^/]+)$'
+    match = re.match(pattern, s)
+    
+    if match:
+        part1 = match.group(1)
+        id = match.group(2)
+        command = match.group(3)
+        return part1, id, command
+    else:
+        raise ValueError("String does not match the expected format")
 
-def init():
-  global select_pin, ch1_pin, ch2_pin, ch3_pin, ch4_pin, ch5_pin, ch_map, up_pin, down_pin, stop_pin
-  select_pin = Pin(CONFIG['select_pin'], mode=Pin.OPEN_DRAIN, value=1)
-  up_pin = Pin(CONFIG['up_pin'], mode=Pin.OPEN_DRAIN, value=1)
-  stop_pin = Pin(CONFIG['stop_pin'], mode=Pin.OPEN_DRAIN, value=1)
-  down_pin = Pin(CONFIG['down_pin'], mode=Pin.OPEN_DRAIN, value=1)
-  
-  ch1_pin = Pin(CONFIG['ch1_pin'], Pin.IN)
-  ch2_pin = Pin(CONFIG['ch2_pin'], Pin.IN)
-  ch3_pin = Pin(CONFIG['ch3_pin'], Pin.IN)
-  ch4_pin = Pin(CONFIG['ch4_pin'], Pin.IN)
-  ch5_pin = Pin(CONFIG['ch5_pin'], Pin.IN)
-
-  ch_map[ch1_pin]=1
-  ch_map[ch2_pin]=2
-  ch_map[ch3_pin]=3
-  ch_map[ch4_pin]=4
-  ch_map[ch5_pin]=5
-  
-  
-  ch1_pin.irq(trigger=Pin.IRQ_FALLING, handler=channel_on)
-  ch2_pin.irq(trigger=Pin.IRQ_FALLING, handler=channel_on)
-  ch3_pin.irq(trigger=Pin.IRQ_FALLING, handler=channel_on)
-  ch4_pin.irq(trigger=Pin.IRQ_FALLING, handler=channel_on)
-  ch5_pin.irq(trigger=Pin.IRQ_FALLING, handler=channel_on)
-  
-
-def sub_cb(topic, msg):
-  global select_pin
+def sub_cb(topic_raw, msg_raw):
+  global ec
+  msg = msg_raw.decode('utf-8')
+  topic = topic_raw.decode('utf-8')
+  try:
+    part1, id, command = parse_string(topic)
+    print(f"Topic: {part1}, channel: {id}, command: {command}")
+  except ValueError as e:
+    print(e)
   print((topic, msg))
-  if(msg == b'up'):
-    print('up click')
-    up_pin.off()
-    time.sleep(1)
-    up_pin.on()
-  elif(msg == b'down'):
-    print('down click')
-    down_pin.off()
-    time.sleep(1)
-    down_pin.on()
-  elif(msg == b'stop'):
-    print('stop click')
-    stop_pin.off()
-    time.sleep(1)
-    stop_pin.on()
-  else:
-    print('select click')
-    select_pin.off()
-    time.sleep(1)
-    select_pin.on()
-  
+  if(command == HA_CONFIG['command_topic']):
+    if(msg == HA_CONFIG['payload_open']):
+      print('up click')
+      ec.up(id)
+    elif(msg == HA_CONFIG['payload_close']):
+      print('down click')
+      ec.down(id)
+    elif(msg == HA_CONFIG['payload_stop']):
+      print('stop click')
+      ec.stop(id)
+
 
 def main():
-    client = MQTTClient(CONFIG['client_id'], CONFIG['broker'])
+    global ec, HA_CONFIG
+    ec = Easycontrol(CONFIG["easycontrol"])
+    ec.init()
+    MQTT_CONFIG = CONFIG['mqtt']
+    HA_CONFIG = CONFIG['ha']
+    client = MQTTClient(MQTT_CONFIG['client_id'], MQTT_CONFIG['broker'])
     client.connect()
-    print("Connected to {}".format(CONFIG['broker']))
+    print("Connected to {}".format(MQTT_CONFIG['broker']))
+    
     client.set_callback(sub_cb)
     client.connect()
-    client.subscribe(b"easycontrol/channel")
+    print("publish availability message")
+    client.publish(MQTT_CONFIG['basic_topic']+"/" + HA_CONFIG['availability_topic'], HA_CONFIG['payload_available'], qos=1)
+    
+    print("subscribe to topic")
+    client.subscribe(MQTT_CONFIG['basic_topic']+"/#")
+    
     while True:
         if True:
             # Blocking wait for message
@@ -138,5 +112,4 @@ def main():
 
 if __name__ == '__main__':
     load_config()
-    init()
     main()
