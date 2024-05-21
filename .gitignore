@@ -129,3 +129,4 @@ dmypy.json
 .pyre/
 config.json
 wlan_config.py
+Easycontrol.stl
