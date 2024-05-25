@@ -1,0 +1,28 @@
+{
+    "mqtt":{
+        "client_id": "esp32_arduino_nano",
+        "basic_topic": "home-assistant/cover",
+        "broker": "192.168.1.1"
+    },
+    "ha":{
+        "state_topic": "state",
+        "command_topic": "set",
+        "payload_open": "OPEN",
+        "payload_close": "CLOSE",
+        "payload_stop": "STOP",
+        "availability_topic": "availability",
+        "payload_available": "online",
+        "payload_not_available": "offline"
+    },
+    "easycontrol": {
+        "select_pin": 8, 
+        "up_pin": 5,
+        "stop_pin": 6,
+        "down_pin": 7,
+        "ch1_pin": 9,
+        "ch2_pin": 10,
+        "ch3_pin": 17,
+        "ch4_pin": 18,
+        "ch5_pin": 21
+    }
+}
