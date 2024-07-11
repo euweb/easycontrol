@@ -94,6 +94,7 @@ def main():
             time.sleep(1)
     finally:
         client.disconnect()
+        machine.reboot()
 
 
 if __name__ == '__main__':
