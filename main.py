@@ -1,6 +1,5 @@
 import machine
 import time
-import ubinascii
 import ure as re
 from umqtt.simple import MQTTClient
 from easycontrol import Easycontrol
@@ -87,16 +86,20 @@ def main():
     tim1 = Timer(1)
     tim1.init(period=60000, mode=Timer.PERIODIC, callback=send_heartbeat)
     
-    try:
-        while 1:
-            # micropython.mem_info()
-            client.check_msg()
-            time.sleep(1)
-    finally:
-        client.disconnect()
-        machine.reboot()
+    while 1:
+        # micropython.mem_info()
+        client.check_msg()
+        time.sleep(1)
 
+def reset():
+    print("Resetting...")
+    time.sleep(5)
+    machine.reset()
 
 if __name__ == '__main__':
-    load_config()
-    main()
+    try:
+        load_config()
+        main()
+    except OSError as e:
+        print("Error: " + str(e))
+        reset()
