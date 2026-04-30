@@ -2,7 +2,9 @@
     "mqtt":{
         "client_id": "esp32_arduino_nano",
         "basic_topic": "home-assistant/cover",
-        "broker": "192.168.1.1"
+        "broker": "192.168.1.1",
+        "username": "",
+        "password": ""
     },
     "ha":{
         "state_topic": "state",

@@ -71,7 +71,12 @@ def main():
     ec.init()
     MQTT_CONFIG = CONFIG['mqtt']
     HA_CONFIG = CONFIG['ha']
-    client = MQTTClient(MQTT_CONFIG['client_id'], MQTT_CONFIG['broker'])
+    client = MQTTClient(
+        MQTT_CONFIG['client_id'],
+        MQTT_CONFIG['broker'],
+        user=MQTT_CONFIG.get('username'),
+        password=MQTT_CONFIG.get('password')
+    )
     client.connect()
     print("Connected to {}".format(MQTT_CONFIG['broker']))
     
