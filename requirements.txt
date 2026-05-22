@@ -1,0 +1,3 @@
+# Dependencies for the PC simulator (simulator.py)
+# Not needed on the ESP32 itself
+paho-mqtt>=2.0
