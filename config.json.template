@@ -9,6 +9,8 @@
     "ha":{
         "state_topic": "state",
         "command_topic": "set",
+        "set_position_topic": "set_position",
+        "position_topic": "position",
         "payload_open": "OPEN",
         "payload_close": "CLOSE",
         "payload_stop": "STOP",
@@ -17,6 +19,12 @@
         "payload_not_available": "offline"
     },
     "easycontrol": {
+        "travel_time": 30,
+        "travel_time_1": 30,
+        "travel_time_2": 30,
+        "travel_time_3": 30,
+        "travel_time_4": 30,
+        "travel_time_5": 30,
         "select_pin": 8, 
         "up_pin": 5,
         "stop_pin": 6,
