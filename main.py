@@ -171,12 +171,12 @@ def _set_travel_time(channel, msg):
             return
         if channel is None:
             _travel_time_default = t
-            print("travel_time default updated to {}s".format(t))
+            _log("travel_time default updated to {}s".format(t))
         else:
             _travel_times[channel] = t
-            print("travel_time ch{} updated to {}s".format(channel, t))
+            _log("travel_time ch{} updated to {}s".format(channel, t))
     except ValueError:
-        print("Invalid travel_time: {}".format(msg))
+        _log("Invalid travel_time: {}".format(msg))
 
 
 def _handle_config_message(topic, msg):
@@ -201,6 +201,17 @@ def sub_cb(topic_raw, msg_raw):
     msg = msg_raw.decode('utf-8')
     topic = topic_raw.decode('utf-8')
 
+    # Ignore topics published by this device to avoid echo loops
+    _outbound = (
+        '/' + HA_CONFIG.get('state_topic', 'state'),
+        '/' + HA_CONFIG.get('position_topic', 'position'),
+        '/' + HA_CONFIG.get('availability_topic', 'availability'),
+        '/log',
+    )
+    for suffix in _outbound:
+        if topic.endswith(suffix):
+            return
+
     # Config updates (not channel commands)
     if topic.startswith(_CONFIG_PREFIX):
         _handle_config_message(topic, msg)
@@ -212,7 +223,7 @@ def sub_cb(topic_raw, msg_raw):
         print(e)
         return
 
-    print("topic: {}, channel: {}, command: {}, payload: {}".format(
+    _log("topic: {}, channel: {}, command: {}, payload: {}".format(
         part1, channel_str, command, msg))
 
     channels = _resolve_channels(channel_str)
@@ -245,7 +256,17 @@ def sub_cb(topic_raw, msg_raw):
             else:
                 print("Position out of range (0-100): {}".format(msg))
         except ValueError:
-            print("Invalid position payload: {}".format(msg))
+            _log("Invalid position payload: {}".format(msg))
+
+
+def _log(msg):
+    """Print to serial and publish to MQTT log topic (if connected)."""
+    print(msg)
+    if client is not None:
+        try:
+            client.publish(MQTT_CONFIG['basic_topic'] + "/log", msg, qos=0)
+        except Exception:
+            pass
 
 
 def send_heartbeat(t):
@@ -285,10 +306,10 @@ def main():
     )
     client.set_callback(sub_cb)
     client.connect()
-    print("Connected to {}".format(MQTT_CONFIG['broker']))
+    _log("Connected to {}".format(MQTT_CONFIG['broker']))
 
     client.subscribe(MQTT_CONFIG['basic_topic'] + "/#")
-    print("Subscribed to {}/#".format(MQTT_CONFIG['basic_topic']))
+    _log("Subscribed to {}/#".format(MQTT_CONFIG['basic_topic']))
     # _TRAVEL_TIME_TOPIC is already covered by the wildcard subscription above.
     # The retained value from the broker is delivered automatically on connect.
 
