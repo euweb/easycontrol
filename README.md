@@ -118,14 +118,36 @@ On the next boot the saved positions are restored and published to Home Assistan
 
 ### Physical remote detection
 
-When the physical EasyControl remote is used to operate a shutter, the ESP32 detects the activity by monitoring the channel-select LEDs:
+The UP, DOWN, and STOP pins are shared open-drain lines between the ESP32 and the EasyControl remote — no additional wiring is needed.  
+Falling-edge interrupts (IRQs) fire the instant the remote pulls a line low, which is much faster and more reliable than polling.
 
-- The device polls `check_channel()` every loop tick (~1 s).
-- If the active channel changes **without** the ESP32 having triggered it, the **previous** channel was operated by the remote.
-- The tracked position for that channel is reset to 50 (`stopped`) and published to Home Assistant.
-- The updated position is also persisted to flash.
+| Remote action | ESP32 behaviour |
+|---|---|
+| UP pressed | Publishes `opening`, tracks position toward 100 using `travel_time` |
+| DOWN pressed | Publishes `closing`, tracks position toward 0 using `travel_time` |
+| STOP pressed | Cancels tracking, estimates intermediate position, publishes `stopped` |
+| Timer expires (motor at end stop) | Sends STOP command (harmless if motor has already stopped), publishes `open`/`closed` |
 
-> **Note:** The invalidation happens when the remote **switches away** from a channel, not at the moment the button is pressed. This is the best resolution possible without additional hardware.
+To prevent the ESP32's own SELECT cycling from triggering spurious IRQs, all three IRQs are suppressed for the entire duration of `select() + command()` and re-enabled afterwards.
+
+> **Limitation:** If the remote is already on the same channel the ESP32 last used and a button is pressed without first pressing SELECT, the position will still be tracked — UP always targets 100, DOWN always targets 0. A manual STOP will produce the correct intermediate position estimate.
+
+### Travel time calibration
+
+The travel time (seconds for a full open/close cycle) can be set per channel via MQTT — the value is retained by the broker and restored automatically on reconnect:
+
+| Topic | Payload | Effect |
+|---|---|---|
+| `home-assistant/cover/config/travel_time` | `30` | Default for all channels |
+| `home-assistant/cover/config/<ch>/travel_time` | `25` | Override for channel `<ch>` |
+
+## MQTT reconnect
+
+If the broker drops the connection (e.g. due to a network hiccup or broker restart), the ESP32 automatically reconnects:
+
+1. Waits 5 seconds, then calls `client.connect()` and re-subscribes.
+2. Re-publishes the availability message and the current state/position of all channels so Home Assistant is immediately up to date.
+3. If the reconnect itself fails, the device performs a soft reset (`machine.reset()`).
 
 ### Travel time calibration
 

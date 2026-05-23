@@ -70,3 +70,11 @@ class Easycontrol:
     def stop(self, channel):
         self.select(channel)
         print(f"[ec]  {_label(int(channel or 0))}: STOP ■")
+
+    def check_command_pins(self):
+        """Stub: physical remote buttons are never pressed in simulation."""
+        return set()
+
+    def get_and_clear_remote_press(self):
+        """Stub: no physical remote in simulation."""
+        return None

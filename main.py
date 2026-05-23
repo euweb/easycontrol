@@ -164,33 +164,69 @@ def _check_timed_moves():
         _save_positions()
 
 
-def _check_external_activity():
-    """Detect physical remote usage by monitoring unexpected channel changes.
+def _start_external_move(channel, target):
+    """Track a remote-initiated move and publish state/position to HA.
+    Does NOT trigger any hardware – the motor is already running.
+    """
+    current = _get_pos(channel)
+    delta = abs(target - current)
+    if delta == 0:
+        return
+    direction = 1 if target > current else -1
+    duration = _get_travel_time(channel) * delta / 100.0
+    if direction > 0:
+        _pub_state(channel, "opening")
+    else:
+        _pub_state(channel, "closing")
+    now = time.time()
+    _active_moves[channel] = {
+        "end_time": now + duration,
+        "target": target,
+        "start_pos": current,
+        "start_time": now,
+        "direction": direction,
+    }
+    _log("External move ch{}: {} → {}".format(channel, current, target))
 
-    When the remote cycles from channel A to channel B (without the ESP32
-    having done it), channel A was likely operated manually.  Its tracked
-    position is therefore no longer trustworthy and gets reset to 50.
+
+def _check_external_activity():
+    """Detect physical remote usage via falling-edge IRQs on UP/DOWN/STOP pins.
+
+    UP/DOWN start position tracking toward 100/0 without triggering hardware.
+    STOP cancels any ongoing tracking and publishes the estimated position.
+    The SELECT pin is intentionally ignored: browsing channels without pressing
+    UP/DOWN/STOP causes no state change.
     """
     global _last_channel
+
+    # Sync _last_channel while any move is active (external or internal).
     if _active_moves:
-        # Keep _last_channel in sync while we are driving the motor ourselves.
-        _last_channel = ec.check_channel()
+        ch = ec.check_channel()
+        if ch >= 0:
+            _last_channel = ch
+
+    # ── IRQ-based button press ────────────────────────────────────────────────
+    pressed = ec.get_and_clear_remote_press()
+    if pressed is None:
         return
-    current_ch = ec.check_channel()
-    if current_ch < 0:
-        return  # no channel active, nothing to do
-    if current_ch == _last_channel:
-        return  # no change
-    if _last_channel is not None:
-        # Channel changed without our doing → remote was used on _last_channel
-        affected = _resolve_channels(_last_channel)
-        for ch in affected:
-            _set_pos(ch, 50)
+
+    ch_sel = _last_channel if (_last_channel is not None and _last_channel >= 0) else None
+    channels = _resolve_channels(ch_sel)
+    if pressed == 'up':
+        for ch in channels:
+            _cancel_timed_move(ch)
+            _start_external_move(ch, 100)
+    elif pressed == 'down':
+        for ch in channels:
+            _cancel_timed_move(ch)
+            _start_external_move(ch, 0)
+    elif pressed == 'stop':
+        for ch in channels:
+            if ch in _active_moves:
+                _cancel_timed_move(ch)
             _pub_state(ch, "stopped")
-            _pub_position(ch, 50)
+            _pub_position(ch, _get_pos(ch))
         _save_positions()
-        _log("Remote detected ch{} → ch{}, position(s) invalidated".format(_last_channel, current_ch))
-    _last_channel = current_ch
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -327,12 +363,48 @@ def _log(msg):
             pass
 
 
+def _mqtt_reconnect():
+    """Reconnect to the MQTT broker and re-subscribe.
+    Resets the device if the reconnect attempt fails.
+    """
+    print("MQTT connection lost, reconnecting ...")
+    try:
+        client.disconnect()
+    except Exception:
+        pass
+    time.sleep(5)
+    try:
+        client.connect()
+        client.set_callback(sub_cb)
+        client.subscribe(MQTT_CONFIG['basic_topic'] + "/#")
+        # Re-publish current state so HA is up to date.
+        client.publish(
+            MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic'],
+            HA_CONFIG['payload_available'], qos=1)
+        for ch in range(1, NUM_CHANNELS + 1):
+            pos = _get_pos(ch)
+            if pos >= 100:
+                state = "open"
+            elif pos <= 0:
+                state = "closed"
+            else:
+                state = "stopped"
+            _pub_state(ch, state)
+            _pub_position(ch, pos)
+        print("Reconnected to {}".format(MQTT_CONFIG['broker']))
+    except Exception as e:
+        print("Reconnect failed: {}".format(e))
+        reset()
+
+
 def send_heartbeat(t):
-    global MQTT_CONFIG, HA_CONFIG, client
     print("publish availability message")
-    client.publish(
-        MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic'],
-        HA_CONFIG['payload_available'], qos=1)
+    try:
+        client.publish(
+            MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic'],
+            HA_CONFIG['payload_available'], qos=1)
+    except OSError:
+        _mqtt_reconnect()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -391,9 +463,13 @@ def main():
     tim1.init(period=60000, mode=Timer.PERIODIC, callback=send_heartbeat)
 
     while True:
-        client.check_msg()
-        _check_timed_moves()
-        _check_external_activity()
+        try:
+            client.check_msg()
+            _check_timed_moves()
+            _check_external_activity()
+        except OSError as e:
+            print("Connection error: {}".format(e))
+            _mqtt_reconnect()
         time.sleep(1)
 
 
