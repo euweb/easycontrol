@@ -35,12 +35,38 @@ def _get_travel_time(channel):
 # Estimated position per channel: 0 (closed) – 100 (open)
 _positions = {}
 
+POSITIONS_FILE = "/positions.json"
+
 # Active timed moves: channel (int) → {end_time, target, start_pos, start_time, direction}
 _active_moves = {}
 
+# Last channel seen on hardware – used to detect physical remote activity
+_last_channel = None
+
+
+def _load_positions():
+    """Load persisted positions from flash. Returns None if not available."""
+    import ujson as json
+    try:
+        with open(POSITIONS_FILE) as f:
+            data = json.loads(f.read())
+            return {str(k): max(0, min(100, int(v))) for k, v in data.items()}
+    except (OSError, ValueError):
+        return None
+
+
+def _save_positions():
+    """Persist current positions to flash."""
+    import ujson as json
+    try:
+        with open(POSITIONS_FILE, "w") as f:
+            f.write(json.dumps(_positions))
+    except OSError as e:
+        print("Could not save positions: {}".format(e))
+
 
 def _get_pos(channel):
-    return _positions.get(str(channel), 0)
+    return _positions.get(str(channel), 50)
 
 
 def _set_pos(channel, pos):
@@ -103,6 +129,7 @@ def _cancel_timed_move(channel):
     moved = int(elapsed / _get_travel_time(channel) * 100)
     estimated = move["start_pos"] + move["direction"] * moved
     _set_pos(channel, estimated)
+    _save_positions()
 
 
 def _check_timed_moves():
@@ -133,6 +160,37 @@ def _check_timed_moves():
             _pub_position(ch, current)
     for ch in done:
         del _active_moves[ch]
+    if done:
+        _save_positions()
+
+
+def _check_external_activity():
+    """Detect physical remote usage by monitoring unexpected channel changes.
+
+    When the remote cycles from channel A to channel B (without the ESP32
+    having done it), channel A was likely operated manually.  Its tracked
+    position is therefore no longer trustworthy and gets reset to 50.
+    """
+    global _last_channel
+    if _active_moves:
+        # Keep _last_channel in sync while we are driving the motor ourselves.
+        _last_channel = ec.check_channel()
+        return
+    current_ch = ec.check_channel()
+    if current_ch < 0:
+        return  # no channel active, nothing to do
+    if current_ch == _last_channel:
+        return  # no change
+    if _last_channel is not None:
+        # Channel changed without our doing → remote was used on _last_channel
+        affected = _resolve_channels(_last_channel)
+        for ch in affected:
+            _set_pos(ch, 50)
+            _pub_state(ch, "stopped")
+            _pub_position(ch, 50)
+        _save_positions()
+        _log("Remote detected ch{} → ch{}, position(s) invalidated".format(_last_channel, current_ch))
+    _last_channel = current_ch
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -280,7 +338,7 @@ def send_heartbeat(t):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global ec, MQTT_CONFIG, HA_CONFIG, client, _travel_time_default, _CONFIG_PREFIX
+    global ec, MQTT_CONFIG, HA_CONFIG, client, _travel_time_default, _CONFIG_PREFIX, _last_channel
 
     MQTT_CONFIG = CONFIG['mqtt']
     HA_CONFIG = CONFIG['ha']
@@ -297,6 +355,7 @@ def main():
 
     ec = Easycontrol(CONFIG["easycontrol"])
     ec.init()
+    _last_channel = ec.check_channel()  # baseline for remote-activity detection
 
     client = MQTTClient(
         MQTT_CONFIG['client_id'],
@@ -313,12 +372,20 @@ def main():
     # _TRAVEL_TIME_TOPIC is already covered by the wildcard subscription above.
     # The retained value from the broker is delivered automatically on connect.
 
-    # Publish initial state (all channels closed at position 0)
+    # Restore persisted positions; fall back to 50 (unknown) so both OPEN and CLOSE always work
     send_heartbeat(None)
+    saved = _load_positions()
     for ch in range(1, NUM_CHANNELS + 1):
-        _set_pos(ch, 0)
-        _pub_state(ch, "closed")
-        _pub_position(ch, 0)
+        pos = saved.get(str(ch), 50) if saved is not None else 50
+        _set_pos(ch, pos)
+        if pos >= 100:
+            state = "open"
+        elif pos <= 0:
+            state = "closed"
+        else:
+            state = "stopped"
+        _pub_state(ch, state)
+        _pub_position(ch, pos)
 
     tim1 = Timer(1)
     tim1.init(period=60000, mode=Timer.PERIODIC, callback=send_heartbeat)
@@ -326,6 +393,7 @@ def main():
     while True:
         client.check_msg()
         _check_timed_moves()
+        _check_external_activity()
         time.sleep(1)
 
 
