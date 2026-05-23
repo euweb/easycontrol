@@ -1,5 +1,5 @@
 # Sensitive config files with credentials
-config.json
+config*.json
 wlan_config.py
 
 # Byte-compiled / optimized / DLL files
