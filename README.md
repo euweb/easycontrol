@@ -161,7 +161,8 @@ The travel time (seconds for a full open/close cycle) can be set per channel via
 ## Home Assistant configuration
 
 Add one `cover` entry per channel to your `configuration.yaml`.  
-Replace `<ch>` with the channel number (1–5) and adjust `basic_topic` to match your `config.json`.
+Use a **YAML anchor** (`&easycontrol_cover`) on the first entry to define the shared fields once, then merge them into every subsequent channel with `<<: *easycontrol_cover`.  
+Only the four channel-specific keys need to be repeated.
 
 ```yaml
 mqtt:
@@ -172,22 +173,24 @@ mqtt:
       state_topic: "home-assistant/cover/1/state"
       position_topic: "home-assistant/cover/1/position"
       set_position_topic: "home-assistant/cover/1/set_position"
-      availability_topic: "home-assistant/cover/availability"
-      payload_open: "OPEN"
-      payload_close: "CLOSE"
-      payload_stop: "STOP"
-      state_open: "open"
-      state_closed: "closed"
-      state_opening: "opening"
-      state_closing: "closing"
-      state_stopped: "stopped"
-      payload_available: "online"
-      payload_not_available: "offline"
-      position_open: 100
-      position_closed: 0
-      optimistic: false
-      retain: false
-      device_class: shutter
+      # ── shared fields – defined once, reused by channels 2–5 ──────────────
+      <<: &easycontrol_cover
+        availability_topic: "home-assistant/cover/availability"
+        payload_open: "OPEN"
+        payload_close: "CLOSE"
+        payload_stop: "STOP"
+        state_open: "open"
+        state_closed: "closed"
+        state_opening: "opening"
+        state_closing: "closing"
+        state_stopped: "stopped"
+        payload_available: "online"
+        payload_not_available: "offline"
+        position_open: 100
+        position_closed: 0
+        optimistic: false
+        retain: false
+        device_class: shutter
 
     - name: "Rolladen Kanal 2"
       unique_id: easycontrol_cover_2
@@ -195,24 +198,4 @@ mqtt:
       state_topic: "home-assistant/cover/2/state"
       position_topic: "home-assistant/cover/2/position"
       set_position_topic: "home-assistant/cover/2/set_position"
-      availability_topic: "home-assistant/cover/availability"
-      payload_open: "OPEN"
-      payload_close: "CLOSE"
-      payload_stop: "STOP"
-      state_open: "open"
-      state_closed: "closed"
-      state_opening: "opening"
-      state_closing: "closing"
-      state_stopped: "stopped"
-      payload_available: "online"
-      payload_not_available: "offline"
-      position_open: 100
-      position_closed: 0
-      optimistic: false
-      retain: false
-      device_class: shutter
-
-    # Repeat for channels 3–5 …
-```
-
-> **Tip:** For a cleaner setup, extract the shared fields into a [MQTT cover package](https://www.home-assistant.io/integrations/cover.mqtt/) or use `!include` anchors to avoid repetition.
+      <<: *easycontrol_cover
