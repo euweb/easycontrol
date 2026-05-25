@@ -136,32 +136,37 @@ def _check_timed_moves():
     """Call from main loop: auto-stop channels that have reached their target time,
     and publish intermediate position updates so Home Assistant shows movement animation."""
     done = []
-    for ch, move in _active_moves.items():
-        now = time.time()
-        if now >= move["end_time"]:
-            ec.stop(ch)
-            _set_pos(ch, move["target"])
-            target = move["target"]
-            if target >= 100:
-                final = "open"
-            elif target <= 0:
-                final = "closed"
+    try:
+        for ch, move in _active_moves.items():
+            now = time.time()
+            if now >= move["end_time"]:
+                ec.stop(ch)
+                _set_pos(ch, move["target"])
+                # Mark as done BEFORE publishing so an OSError during publish
+                # does not leave the channel stuck in _active_moves forever.
+                done.append(ch)
+                target = move["target"]
+                if target >= 100:
+                    final = "open"
+                elif target <= 0:
+                    final = "closed"
+                else:
+                    final = "stopped"
+                _pub_state(ch, final)
+                _pub_position(ch, target)
             else:
-                final = "stopped"
-            _pub_state(ch, final)
-            _pub_position(ch, target)
-            done.append(ch)
-        else:
-            # Publish current estimated position every loop tick → HA animation
-            elapsed = now - move["start_time"]
-            travel = _get_travel_time(ch)
-            moved = elapsed / travel * 100.0
-            current = max(0, min(100, int(move["start_pos"] + move["direction"] * moved)))
-            _pub_position(ch, current)
-    for ch in done:
-        del _active_moves[ch]
-    if done:
-        _save_positions()
+                # Publish current estimated position every loop tick → HA animation
+                elapsed = now - move["start_time"]
+                travel = _get_travel_time(ch)
+                moved = elapsed / travel * 100.0
+                current = max(0, min(100, int(move["start_pos"] + move["direction"] * moved)))
+                _pub_position(ch, current)
+    finally:
+        # Always clean up completed channels, even if a publish raised an exception.
+        for ch in done:
+            _active_moves.pop(ch, None)
+        if done:
+            _save_positions()
 
 
 def _start_external_move(channel, target):
