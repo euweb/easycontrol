@@ -204,18 +204,20 @@ def _check_external_activity():
     """
     global _last_channel
 
-    # Sync _last_channel while any move is active (external or internal).
-    if _active_moves:
-        ch = ec.check_channel()
-        if ch >= 0:
-            _last_channel = ch
-
     # ── IRQ-based button press ────────────────────────────────────────────────
-    pressed = ec.get_and_clear_remote_press()
+    pressed, irq_ch = ec.get_and_clear_remote_press()
     if pressed is None:
         return
 
-    ch_sel = _last_channel if (_last_channel is not None and _last_channel >= 0) else None
+    # The IRQ reads the channel LED at the exact moment of the button press.
+    # Fall back to _last_channel if the IRQ reading was indeterminate.
+    if irq_ch is not None and irq_ch >= 0:
+        ch_sel = irq_ch
+        _last_channel = irq_ch  # keep _last_channel in sync
+    else:
+        ch_sel = _last_channel if (_last_channel is not None and _last_channel >= 0) else None
+
+    _log("IRQ detected: {} ch={}".format(pressed, ch_sel))
     channels = _resolve_channels(ch_sel)
     if pressed == 'up':
         for ch in channels:
@@ -226,12 +228,16 @@ def _check_external_activity():
             _cancel_timed_move(ch)
             _start_external_move(ch, 0)
     elif pressed == 'stop':
+        stopped = []
         for ch in channels:
             if ch in _active_moves:
                 _cancel_timed_move(ch)
+                stopped.append(ch)
+        for ch in stopped:
             _pub_state(ch, "stopped")
             _pub_position(ch, _get_pos(ch))
-        _save_positions()
+        if stopped:
+            _save_positions()
 
 
 # ── Config ────────────────────────────────────────────────────────────────────

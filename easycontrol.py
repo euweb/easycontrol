@@ -20,19 +20,51 @@ class Easycontrol:
     # Values: 'up', 'down', 'stop', or None.  Cleared by get_and_clear_remote_press().
     _remote_pressed = None
 
+    # Channel read at IRQ time (same moment the LED lights up).
+    # -1 = undetermined, 0 = all channels, 1-5 = specific channel.
+    _irq_channel = None
+
+    # Pre-allocated reference to channel LED pins for IRQ-safe reading (no heap alloc).
+    _ch_pins = None
+
+    # ── IRQ helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _read_channel():
+        """Read active channel from LED pins without heap allocation (IRQ-safe)."""
+        p = Easycontrol._ch_pins
+        if p is None:
+            return -1
+        c1 = p[0].value()
+        c2 = p[1].value()
+        c3 = p[2].value()
+        c4 = p[3].value()
+        c5 = p[4].value()
+        if c1 and c2 and c3 and c4 and c5:
+            return 0
+        if c1: return 1
+        if c2: return 2
+        if c3: return 3
+        if c4: return 4
+        if c5: return 5
+        return -1
+
     # ── IRQ handlers (must be static – no heap allocation in interrupt context) ───
 
     @staticmethod
     def _irq_up(pin):
         Easycontrol._remote_pressed = 'up'
+        Easycontrol._irq_channel = Easycontrol._read_channel()
 
     @staticmethod
     def _irq_down(pin):
         Easycontrol._remote_pressed = 'down'
+        Easycontrol._irq_channel = Easycontrol._read_channel()
 
     @staticmethod
     def _irq_stop(pin):
         Easycontrol._remote_pressed = 'stop'
+        Easycontrol._irq_channel = Easycontrol._read_channel()
 
     def __init__(self, config):
         self.CONFIG = config
@@ -50,6 +82,8 @@ class Easycontrol:
         ch5_pin = Pin(self.CONFIG['ch5_pin'], Pin.IN)
 
         self.channels = [ch1_pin, ch2_pin, ch3_pin, ch4_pin, ch5_pin]
+        # Make channel pins accessible to the static IRQ handler without heap allocation.
+        Easycontrol._ch_pins = self.channels
 
         # Attach falling-edge IRQs: fires the instant the line goes low (button pressed).
         # The ESP32's own 100 ms pulses are suppressed in _up()/_down()/_stop() below.
@@ -62,6 +96,7 @@ class Easycontrol:
         Called before select() so noise during channel cycling is ignored.
         """
         Easycontrol._remote_pressed = None
+        Easycontrol._irq_channel = None
         self.up_pin.irq(handler=None)
         self.down_pin.irq(handler=None)
         self.stop_pin.irq(handler=None)
@@ -106,11 +141,14 @@ class Easycontrol:
         self._restore_irqs()
 
     def get_and_clear_remote_press(self):
-        """Return the button the physical remote last pressed ('up'/'down'/'stop'),
-        then clear the flag.  Returns None if no press was recorded."""
+        """Return (button, channel) captured at IRQ time, then clear both flags.
+        button  : 'up' / 'down' / 'stop', or None if no press was recorded.
+        channel : 0 = all channels, 1-5 = specific channel, -1 = undetermined."""
         pressed = Easycontrol._remote_pressed
+        channel = Easycontrol._irq_channel
         Easycontrol._remote_pressed = None
-        return pressed
+        Easycontrol._irq_channel = None
+        return pressed, channel
 
     def check_channel(self):
         """Funktion zum Überprüfen der LED-Zustände"""

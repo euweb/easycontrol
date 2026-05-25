@@ -76,5 +76,5 @@ class Easycontrol:
         return set()
 
     def get_and_clear_remote_press(self):
-        """Stub: no physical remote in simulation."""
-        return None
+        """Stub: no physical remote in simulation. Returns (None, None)."""
+        return None, None
