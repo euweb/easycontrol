@@ -95,7 +95,40 @@ The device subscribes to `<basic_topic>/#`. Commands are sent to the following t
 | `home-assistant/cover/set` | Command for all channels |
 | `home-assistant/cover/availability` | Availability heartbeat (online / offline, every minute) |
 
-## Testing MQTT
+## Development & Testing
+
+### Unit tests
+
+Install dependencies once:
+```bash
+pip install -r requirements.txt
+```
+
+Run all tests:
+```bash
+python -m pytest tests/
+```
+
+Run with verbose output:
+```bash
+python -m pytest tests/ -v
+```
+
+Run a specific test class or method:
+```bash
+python -m pytest tests/ -v -k TestTimedMoves
+python -m pytest tests/ -v -k test_auto_stop_after_end_time
+```
+
+### Simulate `main.py` on the PC
+
+```bash
+python run_main.py
+```
+
+Uses `config-simulator.json` and the stubs in `stubs/` — no ESP32 required.
+
+### Testing MQTT
 
 ```bash
 # Listen to all messages
