@@ -43,7 +43,10 @@ class _Base(unittest.TestCase):
     def setUp(self):
         main._positions = {}
         main._active_moves = {}
-        main._last_channel = None
+        main._pending_mqtt_messages = []
+        main._pending_positions = {}
+        main._last_position_flush = 0
+        main._log_enabled = True
         main._travel_time_default = 30.0
         main._travel_times = {}
         main._CONFIG_PREFIX = "ha/cover/config/"
@@ -200,6 +203,14 @@ class TestTimedMoves(_Base):
         main.ec.down.assert_called_once_with(1)
         self.assertEqual(main._active_moves[1]["direction"], -1)
 
+    def test_opening_state_uses_qos0(self):
+        main._set_pos(1, 0)
+        with patch("time.time", return_value=1000.0):
+            main._start_timed_move(1, 100)
+        state_call = main.client.publish.call_args_list[0]
+        self.assertEqual(state_call.args[1], "opening")
+        self.assertEqual(state_call.kwargs["qos"], 0)
+
     def test_no_move_when_already_at_target(self):
         main._set_pos(1, 100)
         main._start_timed_move(1, 100)
@@ -228,7 +239,7 @@ class TestTimedMoves(_Base):
         self.assertNotIn(99, main._active_moves)
 
     def test_auto_stop_after_end_time(self):
-        """An expired move triggers ec.stop and publishes 'closed'."""
+        """An expired full-close move must NOT send hardware STOP."""
         main._set_pos(1, 100)
         with patch("time.time", return_value=1000.0):
             main._start_timed_move(1, 0)    # end_time = 1030
@@ -238,11 +249,26 @@ class TestTimedMoves(_Base):
         with patch("time.time", return_value=1031.0):
             main._check_timed_moves()
 
-        main.ec.stop.assert_called_once_with(1)
+        main.ec.stop.assert_not_called()
         self.assertEqual(main._get_pos(1), 0)
         self.assertNotIn(1, main._active_moves)
         payloads = [c.args[1] for c in main.client.publish.call_args_list]
         self.assertIn("closed", payloads)
+
+    def test_auto_stop_intermediate_target_sends_hardware_stop(self):
+        """Intermediate target requires hardware STOP to halt movement."""
+        main._set_pos(1, 0)
+        with patch("time.time", return_value=1000.0):
+            main._start_timed_move(1, 50)  # end_time = 1015
+        main.ec.up.reset_mock()
+        main.client.publish.reset_mock()
+
+        with patch("time.time", return_value=1016.0):
+            main._check_timed_moves()
+
+        main.ec.stop.assert_called_once_with(1)
+        self.assertEqual(main._get_pos(1), 50)
+        self.assertNotIn(1, main._active_moves)
 
     def test_auto_stop_open_publishes_open(self):
         """An expired open move publishes 'open'."""
@@ -255,7 +281,7 @@ class TestTimedMoves(_Base):
         self.assertIn("open", payloads)
 
     def test_intermediate_position_published(self):
-        """An in-progress move publishes the current position and does not call ec.stop."""
+        """An in-progress move buffers the current position and does not call ec.stop."""
         main._set_pos(1, 0)
         with patch("time.time", return_value=1000.0):
             main._start_timed_move(1, 100)
@@ -266,8 +292,14 @@ class TestTimedMoves(_Base):
 
         main.ec.stop.assert_not_called()
         self.assertIn(1, main._active_moves)
-        payloads = [c.args[1] for c in main.client.publish.call_args_list]
-        self.assertIn("50", payloads)
+        # Position is buffered, not yet published to MQTT
+        self.assertEqual(main._pending_positions.get(1), 50)
+        # No position publish should have been issued directly
+        position_calls = [
+            c for c in main.client.publish.call_args_list
+            if c.args[0].endswith("/position")
+        ]
+        self.assertEqual(position_calls, [])
 
     def test_channel_removed_from_active_moves_on_publish_error(self):
         """Channel is removed from _active_moves even when publish raises OSError.
@@ -323,6 +355,18 @@ class TestCheckExternalActivity(_Base):
         self.assertIn(1, main._active_moves)
         self.assertEqual(main._active_moves[1]["target"], 0)
 
+    def test_external_move_start_uses_qos0(self):
+        main._set_pos(1, 0)
+        main.ec.get_and_clear_remote_press.return_value = ("up", 1)
+        with patch("time.time", return_value=1000.0):
+            main._check_external_activity()
+        state_calls = [
+            c for c in main.client.publish.call_args_list
+            if c.args[0].endswith("/state")
+        ]
+        self.assertEqual(state_calls[0].args[1], "opening")
+        self.assertEqual(state_calls[0].kwargs["qos"], 0)
+
     def test_stop_press_cancels_active_move(self):
         main._set_pos(2, 0)
         with patch("time.time", return_value=1000.0):
@@ -355,19 +399,20 @@ class TestCheckExternalActivity(_Base):
         ]
         self.assertEqual(non_log_calls, [])
 
-    def test_irq_channel_takes_priority_over_last_channel(self):
-        """The channel read at IRQ time must override the stale _last_channel."""
-        main._last_channel = 3
+    def test_irq_channel_takes_priority_over_software_channel(self):
+        """A valid IRQ channel must override the current software-tracked channel."""
+        main.ec.check_channel.return_value = 3
         main._set_pos(2, 0)
         main.ec.get_and_clear_remote_press.return_value = ("up", 2)
         with patch("time.time", return_value=0.0):
             main._check_external_activity()
         self.assertIn(2, main._active_moves)
         self.assertNotIn(3, main._active_moves)
+        self.assertEqual(main.ec._selected_ch, 2)
 
-    def test_irq_channel_minus1_falls_back_to_last_channel(self):
-        """irq_ch == -1 (undetermined) → _last_channel is used as fallback."""
-        main._last_channel = 1
+    def test_irq_channel_minus1_falls_back_to_check_channel(self):
+        """irq_ch == -1 (undetermined) → software-tracked channel is used."""
+        main.ec.check_channel.return_value = 1
         main._set_pos(1, 0)
         main.ec.get_and_clear_remote_press.return_value = ("up", -1)
         with patch("time.time", return_value=0.0):
@@ -397,6 +442,14 @@ class TestCheckExternalActivity(_Base):
 class TestSubCb(_Base):
     def _call(self, topic: str, payload: str):
         main.sub_cb(topic.encode(), payload.encode())
+        main._process_pending_mqtt_messages()
+
+    def test_sub_cb_only_queues_message(self):
+        main.sub_cb(b"ha/cover/1/set", b"OPEN")
+        self.assertEqual(main._pending_mqtt_messages, [("ha/cover/1/set", "OPEN")])
+        main.ec.up.assert_not_called()
+        main._process_pending_mqtt_messages()
+        main.ec.up.assert_called_once_with(1)
 
     def test_open_command(self):
         main._set_pos(1, 0)
@@ -416,6 +469,13 @@ class TestSubCb(_Base):
         main._set_pos(1, 50)
         with patch("time.time", return_value=0.0):
             main._start_timed_move(1, 100)
+        self._call("ha/cover/1/set", "STOP")
+        main.ec.stop.assert_called_with(1)
+        self.assertNotIn(1, main._active_moves)
+
+    def test_stop_command_also_fires_without_active_move(self):
+        """HA STOP always triggers hardware stop – shutter may run from physical remote."""
+        main._set_pos(1, 0)
         self._call("ha/cover/1/set", "STOP")
         main.ec.stop.assert_called_with(1)
         self.assertNotIn(1, main._active_moves)
@@ -470,6 +530,18 @@ class TestSubCb(_Base):
         payloads = [c.args[1] for c in main.client.publish.call_args_list]
         self.assertIn("stopped", payloads)
 
+    def test_stop_command_without_active_move_publishes_stopped(self):
+        """Idle HA STOP must still publish state=stopped."""
+        main._set_pos(1, 0)
+        main.client.publish.reset_mock()
+        self._call("ha/cover/1/set", "STOP")
+        state_calls = [
+            c for c in main.client.publish.call_args_list
+            if c.args[0].endswith("/state")
+        ]
+        self.assertEqual(len(state_calls), 1)
+        self.assertEqual(state_calls[0].args[1], "stopped")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config messages
@@ -488,6 +560,16 @@ class TestHandleConfigMessage(_Base):
     def test_unknown_key_ignored(self):
         main._handle_config_message("ha/cover/config/unknown", "value")
         self.assertEqual(main._travel_time_default, 30.0)  # no crash, no change
+
+    def test_log_enabled_on(self):
+        main._log_enabled = False
+        main._handle_config_message("ha/cover/config/log_enabled", "on")
+        self.assertTrue(main._log_enabled)
+
+    def test_log_enabled_off(self):
+        main._log_enabled = True
+        main._handle_config_message("ha/cover/config/log_enabled", "off")
+        self.assertFalse(main._log_enabled)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

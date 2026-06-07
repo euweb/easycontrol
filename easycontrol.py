@@ -1,6 +1,27 @@
 from machine import Pin
 import time
 
+# Channel cycle: matches physical remote select-button rotation.
+_CHANNEL_SEQUENCE = [1, 2, 3, 4, 5, 0]
+
+# Logger used by select() so messages reach MQTT at runtime.
+_logger = print
+
+
+def set_logger(fn):
+    global _logger
+    _logger = fn
+
+# Give the controller a short moment to latch the new channel before sending
+# the subsequent UP/DOWN/STOP pulse. Without this, the pulse may still hit the
+# previously selected channel.
+_SELECT_SETTLE_TIME = 0.5
+
+# The selected channel LED is visible briefly after a SELECT pulse.
+# Poll in small steps so we can detect the new channel without long blocking.
+_SELECT_POLL_INTERVAL = 0.01   # 10 ms between reads
+_SELECT_POLL_ATTEMPTS = 30     # up to 300 ms total polling window
+
 
 class Easycontrol:
 
@@ -85,6 +106,10 @@ class Easycontrol:
         # Make channel pins accessible to the static IRQ handler without heap allocation.
         Easycontrol._ch_pins = self.channels
 
+        # Assume channel 1 is active after power-on (physical remote default).
+        # Tracked in software because the LEDs are only briefly lit on button press.
+        self._selected_ch = 1
+
         # Attach falling-edge IRQs: fires the instant the line goes low (button pressed).
         # The ESP32's own 100 ms pulses are suppressed in _up()/_down()/_stop() below.
         self.up_pin.irq(trigger=Pin.IRQ_FALLING, handler=Easycontrol._irq_up)
@@ -124,20 +149,26 @@ class Easycontrol:
 
     def up(self, channel):
         self._suppress_irqs()
-        self.select(channel)
-        self._up()
+        if self.select(channel):
+            self._up()
+        else:
+            _logger("up: aborted, channel selection failed")
         self._restore_irqs()
 
     def down(self, channel):
         self._suppress_irqs()
-        self.select(channel)
-        self._down()
+        if self.select(channel):
+            self._down()
+        else:
+            _logger("down: aborted, channel selection failed")
         self._restore_irqs()
 
     def stop(self, channel):
         self._suppress_irqs()
-        self.select(channel)
-        self._stop()
+        if self.select(channel):
+            self._stop()
+        else:
+            _logger("stop: aborted, channel selection failed")
         self._restore_irqs()
 
     def get_and_clear_remote_press(self):
@@ -151,10 +182,15 @@ class Easycontrol:
         return pressed, channel
 
     def check_channel(self):
-        """Funktion zum Überprüfen der LED-Zustände"""
+        """Read selected channel from LED inputs.
+
+        Returns:
+            0  -> all channels selected
+            1..5 -> selected channel
+            -1 -> indeterminate (no LED active)
+        """
         states = [channel.value() for channel in self.channels]
-        print(states)
-        
+
         if all(state == 1 for state in states):
             return 0  # all channels are selected
         elif all(state == 0 for state in states):
@@ -166,23 +202,71 @@ class Easycontrol:
                     return i+1
         return -1  # catch all, should not occur
 
+    def _poll_selected_after_click(self, prev_channel):
+        """Poll LED inputs for a new channel, ignoring prev_channel (afterglow).
+
+        No initial delay – caller may invoke this both during and after the pulse
+        to maximise the detection window.
+        """
+        for _ in range(_SELECT_POLL_ATTEMPTS):
+            detected = self.check_channel()
+            if detected >= 0 and detected != prev_channel:
+                return detected
+            time.sleep(_SELECT_POLL_INTERVAL)
+        return -1
+
     def select(self, channel):
-        if(channel == None):
+        if channel is None:
             channel = 0
         channel = int(channel)
-        self.selected = self.check_channel()
-        print(f"select channel: {channel}")
-        i=0
-        while( ( self.selected != channel ) and (i < 10) ):
+
+        # Sync software state from hardware if LED is currently visible.
+        hw_now = self.check_channel()
+        if hw_now >= 0:
+            self._selected_ch = hw_now
+
+        _logger("select({}): sw_ch={}".format(channel, self._selected_ch))
+
+        steps = 0            # number of SELECT pulses actually sent
+        max_steps = len(_CHANNEL_SEQUENCE) * 2  # allow extra retries
+        while self._selected_ch != channel and steps < max_steps:
+            prev_channel = self._selected_ch
+
+            # Send 100 ms pulse – log pin transitions so we can verify in MQTT.
+            _logger("select: pulse start (select_pin LOW)")
             self.select_pin.off()
             time.sleep(0.1)
             self.select_pin.on()
-            time.sleep(0.02)
-            self.selected = self.check_channel()
-            print(f"desired: {channel}, got: {self.selected}, i: {i}")
-            time.sleep(1)
-            i = i + 1
+            _logger("select: pulse end (select_pin HIGH)")
 
-        
+            # Wait a fixed 150 ms for the hardware to register the pulse and
+            # light the new channel LED (original firmware used ~120 ms).
+            time.sleep(0.15)
+            detected = self.check_channel()
 
-    
+            steps += 1
+            if detected >= 0 and detected != prev_channel:
+                # LED confirmed new channel.
+                self._selected_ch = detected
+                _logger("select: LED ch={} after {} pulses".format(detected, steps))
+            elif detected == channel:
+                # LED shows target channel (may equal prev in some edge cases).
+                self._selected_ch = detected
+                _logger("select: LED ch={} (target) after {} pulses".format(detected, steps))
+            elif detected == prev_channel:
+                # Hardware acknowledged the pulse, but still reports old channel.
+                # Observed behavior: first pulse can be a "priming" pulse.
+                _logger("select: priming pulse (still ch={})".format(prev_channel))
+            else:
+                # No reliable LED confirmation -> do NOT advance software state.
+                _logger("select: no LED confirmation (raw={}), retry".format(detected))
+
+        if self._selected_ch == channel:
+            if steps > 0:
+                time.sleep(_SELECT_SETTLE_TIME)
+            _logger("select: ch{} OK (pulses={})".format(channel, steps))
+            return True
+        else:
+            _logger("select: WARNING ch{} not reached (sw_ch={})".format(channel, self._selected_ch))
+            return False
+

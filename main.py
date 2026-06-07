@@ -1,6 +1,7 @@
 import machine
 import time
 import ure as re
+import easycontrol as _ec_mod
 from umqtt.simple import MQTTClient
 from easycontrol import Easycontrol
 from machine import Timer
@@ -40,8 +41,23 @@ POSITIONS_FILE = "/positions.json"
 # Active timed moves: channel (int) → {end_time, target, start_pos, start_time, direction}
 _active_moves = {}
 
-# Last channel seen on hardware – used to detect physical remote activity
-_last_channel = None
+# Incoming MQTT packets are queued by sub_cb and processed from the main loop.
+# This avoids socket writes from inside the umqtt callback.
+_pending_mqtt_messages = []
+
+# Heartbeat timer only flips this flag. The actual MQTT publish runs in the main
+# loop so socket I/O never happens from interrupt context.
+_heartbeat_due = False
+
+# Runtime logging toggle (serial + MQTT /log topic).
+_log_enabled = True
+
+# Buffered position updates. Only the latest value per channel is kept.
+# Flushed to MQTT every _POSITION_FLUSH_INTERVAL seconds so position
+# publishing never blocks command processing.
+_pending_positions = {}
+_last_position_flush = 0
+_POSITION_FLUSH_INTERVAL = 2  # seconds
 
 
 def _load_positions():
@@ -82,14 +98,35 @@ def _resolve_channels(channel):
 
 # ── MQTT publish helpers ──────────────────────────────────────────────────────
 
-def _pub_state(channel, state):
+def _pub_state(channel, state, qos=1):
     topic = MQTT_CONFIG['basic_topic'] + "/" + str(channel) + "/" + HA_CONFIG['state_topic']
-    client.publish(topic, state, qos=1)
+    client.publish(topic, state, qos=qos)
 
 
-def _pub_position(channel, pos):
+def _pub_position(channel, pos, qos=1):
     topic = MQTT_CONFIG['basic_topic'] + "/" + str(channel) + "/" + HA_CONFIG.get('position_topic', 'position')
-    client.publish(topic, str(pos), qos=1)
+    client.publish(topic, str(pos), qos=qos)
+
+
+def _queue_position(channel, pos):
+    """Buffer a position update. The actual publish happens in _flush_pending_positions."""
+    _pending_positions[channel] = max(0, min(100, int(pos)))
+
+
+def _flush_pending_positions(force=False):
+    """Publish all buffered position updates if the flush interval has elapsed."""
+    global _last_position_flush
+    now = time.time()
+    if not force and now - _last_position_flush < _POSITION_FLUSH_INTERVAL:
+        return
+    _last_position_flush = now
+    for ch in list(_pending_positions):
+        _pub_position(ch, _pending_positions.pop(ch), qos=0)
+
+
+def _pub_availability():
+    topic = MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic']
+    client.publish(topic, HA_CONFIG['payload_available'], qos=1)
 
 
 # ── Timed movement ────────────────────────────────────────────────────────────
@@ -104,11 +141,11 @@ def _start_timed_move(channel, target):
     duration = _get_travel_time(channel) * delta / 100.0
 
     if direction > 0:
+        _pub_state(channel, "opening", qos=0)
         ec.up(channel)
-        _pub_state(channel, "opening")
     else:
+        _pub_state(channel, "closing", qos=0)
         ec.down(channel)
-        _pub_state(channel, "closing")
 
     now = time.time()
     _active_moves[channel] = {
@@ -140,12 +177,16 @@ def _check_timed_moves():
         for ch, move in _active_moves.items():
             now = time.time()
             if now >= move["end_time"]:
-                ec.stop(ch)
-                _set_pos(ch, move["target"])
+                target = move["target"]
+                # For full-range moves (0 or 100), shutters stop mechanically
+                # at the end-stop; sending STOP here causes an unnecessary
+                # select() cycle. For intermediate targets we must send STOP.
+                if 0 < target < 100:
+                    ec.stop(ch)
+                _set_pos(ch, target)
                 # Mark as done BEFORE publishing so an OSError during publish
                 # does not leave the channel stuck in _active_moves forever.
                 done.append(ch)
-                target = move["target"]
                 if target >= 100:
                     final = "open"
                 elif target <= 0:
@@ -153,14 +194,14 @@ def _check_timed_moves():
                 else:
                     final = "stopped"
                 _pub_state(ch, final)
-                _pub_position(ch, target)
+                _queue_position(ch, target)
             else:
-                # Publish current estimated position every loop tick → HA animation
+                # Buffer current estimated position → flushed periodically to HA
                 elapsed = now - move["start_time"]
                 travel = _get_travel_time(ch)
                 moved = elapsed / travel * 100.0
                 current = max(0, min(100, int(move["start_pos"] + move["direction"] * moved)))
-                _pub_position(ch, current)
+                _queue_position(ch, current)
     finally:
         # Always clean up completed channels, even if a publish raised an exception.
         for ch in done:
@@ -180,9 +221,9 @@ def _start_external_move(channel, target):
     direction = 1 if target > current else -1
     duration = _get_travel_time(channel) * delta / 100.0
     if direction > 0:
-        _pub_state(channel, "opening")
+        _pub_state(channel, "opening", qos=0)
     else:
-        _pub_state(channel, "closing")
+        _pub_state(channel, "closing", qos=0)
     now = time.time()
     _active_moves[channel] = {
         "end_time": now + duration,
@@ -202,20 +243,19 @@ def _check_external_activity():
     The SELECT pin is intentionally ignored: browsing channels without pressing
     UP/DOWN/STOP causes no state change.
     """
-    global _last_channel
-
     # ── IRQ-based button press ────────────────────────────────────────────────
     pressed, irq_ch = ec.get_and_clear_remote_press()
     if pressed is None:
         return
 
-    # The IRQ reads the channel LED at the exact moment of the button press.
-    # Fall back to _last_channel if the IRQ reading was indeterminate.
+    # The IRQ tries to read the channel LED at button-press time.
+    # LEDs are only briefly lit → reading may be unreliable (-1).
+    # Fall back to the software-tracked channel state which is always valid.
     if irq_ch is not None and irq_ch >= 0:
         ch_sel = irq_ch
-        _last_channel = irq_ch  # keep _last_channel in sync
+        ec._selected_ch = irq_ch  # re-sync software state from hardware read
     else:
-        ch_sel = _last_channel if (_last_channel is not None and _last_channel >= 0) else None
+        ch_sel = ec.check_channel()  # software-tracked, always valid
 
     _log("IRQ detected: {} ch={}".format(pressed, ch_sel))
     channels = _resolve_channels(ch_sel)
@@ -235,7 +275,7 @@ def _check_external_activity():
                 stopped.append(ch)
         for ch in stopped:
             _pub_state(ch, "stopped")
-            _pub_position(ch, _get_pos(ch))
+            _queue_position(ch, _get_pos(ch))
         if stopped:
             _save_positions()
 
@@ -284,11 +324,29 @@ def _set_travel_time(channel, msg):
         _log("Invalid travel_time: {}".format(msg))
 
 
+def _set_log_enabled(msg):
+    """Enable/disable runtime logging via config topic payload."""
+    global _log_enabled
+    value = str(msg).strip().lower()
+    if value in ("1", "true", "on", "yes"):
+        _log_enabled = True
+        _log("log_enabled updated: on")
+    elif value in ("0", "false", "off", "no"):
+        if _log_enabled:
+            _log("log_enabled updated: off")
+        _log_enabled = False
+        print("log_enabled updated: off")
+    else:
+        _log("Invalid log_enabled value: {}".format(msg))
+
+
 def _handle_config_message(topic, msg):
     """Dispatch config/... topics to the right handler."""
     suffix = topic[len(_CONFIG_PREFIX):]  # e.g. "travel_time" or "3/travel_time"
     if suffix == "travel_time":
         _set_travel_time(None, msg)
+    elif suffix == "log_enabled":
+        _set_log_enabled(msg)
     else:
         parts = suffix.split("/")
         if len(parts) == 2 and parts[1] == "travel_time":
@@ -302,9 +360,8 @@ def _handle_config_message(topic, msg):
 
 # ── MQTT callbacks ────────────────────────────────────────────────────────────
 
-def sub_cb(topic_raw, msg_raw):
-    msg = msg_raw.decode('utf-8')
-    topic = topic_raw.decode('utf-8')
+def _handle_mqtt_message(topic, msg):
+    """Process one MQTT message from the main loop context."""
 
     # Ignore topics published by this device to avoid echo loops
     _outbound = (
@@ -336,20 +393,29 @@ def sub_cb(topic_raw, msg_raw):
     if command == HA_CONFIG['command_topic']:
         if msg == HA_CONFIG['payload_open']:
             for ch in channels:
+                move = _active_moves.get(ch)
+                if move and move['target'] == 100 and move['direction'] > 0:
+                    continue  # already opening toward 100 – ignore duplicate
                 _cancel_timed_move(ch)
                 _start_timed_move(ch, 100)
 
         elif msg == HA_CONFIG['payload_close']:
             for ch in channels:
+                move = _active_moves.get(ch)
+                if move and move['target'] == 0 and move['direction'] < 0:
+                    continue  # already closing toward 0 – ignore duplicate
                 _cancel_timed_move(ch)
                 _start_timed_move(ch, 0)
 
         elif msg == HA_CONFIG['payload_stop']:
             for ch in channels:
+                was_active = ch in _active_moves
                 _cancel_timed_move(ch)
+                # Always send hardware stop – the shutter may have been started
+                # from the physical remote without a tracked _active_moves entry.
                 ec.stop(ch)
                 _pub_state(ch, "stopped")
-                _pub_position(ch, _get_pos(ch))
+                _queue_position(ch, _get_pos(ch))
 
     elif command == HA_CONFIG.get('set_position_topic', 'set_position'):
         try:
@@ -364,8 +430,26 @@ def sub_cb(topic_raw, msg_raw):
             _log("Invalid position payload: {}".format(msg))
 
 
+def sub_cb(topic_raw, msg_raw):
+    topic = topic_raw.decode('utf-8')
+    msg = msg_raw.decode('utf-8')
+    _pending_mqtt_messages.append((topic, msg))
+
+
+def _process_pending_mqtt_messages():
+    global _pending_mqtt_messages
+    if not _pending_mqtt_messages:
+        return
+    pending = _pending_mqtt_messages
+    _pending_mqtt_messages = []
+    for topic, msg in pending:
+        _handle_mqtt_message(topic, msg)
+
+
 def _log(msg):
     """Print to serial and publish to MQTT log topic (if connected)."""
+    if not _log_enabled:
+        return
     print(msg)
     if client is not None:
         try:
@@ -379,6 +463,7 @@ def _mqtt_reconnect():
     Resets the device if the reconnect attempt fails.
     """
     print("MQTT connection lost, reconnecting ...")
+    global _heartbeat_due
     try:
         client.disconnect()
     except Exception:
@@ -393,15 +478,26 @@ def _mqtt_reconnect():
             MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic'],
             HA_CONFIG['payload_available'], qos=1)
         for ch in range(1, NUM_CHANNELS + 1):
-            pos = _get_pos(ch)
-            if pos >= 100:
-                state = "open"
-            elif pos <= 0:
-                state = "closed"
+            if ch in _active_moves:
+                # Channel is mid-move – estimate actual current position.
+                move = _active_moves[ch]
+                elapsed = time.time() - move["start_time"]
+                moved = elapsed / _get_travel_time(ch) * 100.0
+                pos = max(0, min(100, int(move["start_pos"] + move["direction"] * moved)))
+                state = "opening" if move["direction"] > 0 else "closing"
             else:
-                state = "stopped"
+                pos = _get_pos(ch)
+                if pos >= 100:
+                    state = "open"
+                elif pos <= 0:
+                    state = "closed"
+                else:
+                    state = "stopped"
             _pub_state(ch, state)
-            _pub_position(ch, pos)
+            _pub_position(ch, pos)  # immediate on reconnect – clears stale HA display
+        _pending_positions.clear()  # discard buffered values; reconnect just published truth
+        _flush_pending_positions(force=True)  # reset the flush timer
+        _heartbeat_due = False  # timer may have fired during sleep(5); avoid duplicate online
         print("Reconnected to {}".format(MQTT_CONFIG['broker']))
     except Exception as e:
         print("Reconnect failed: {}".format(e))
@@ -409,22 +505,18 @@ def _mqtt_reconnect():
 
 
 def send_heartbeat(t):
-    print("publish availability message")
-    try:
-        client.publish(
-            MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic'],
-            HA_CONFIG['payload_available'], qos=1)
-    except OSError:
-        _mqtt_reconnect()
+    global _heartbeat_due
+    _heartbeat_due = True
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    global ec, MQTT_CONFIG, HA_CONFIG, client, _travel_time_default, _CONFIG_PREFIX, _last_channel
+    global ec, MQTT_CONFIG, HA_CONFIG, client, _travel_time_default, _CONFIG_PREFIX, _heartbeat_due, _last_position_flush, _log_enabled
 
     MQTT_CONFIG = CONFIG['mqtt']
     HA_CONFIG = CONFIG['ha']
+    _log_enabled = bool(MQTT_CONFIG.get('log_enabled', True))
     ec_cfg = CONFIG.get('easycontrol', {})
 
     # Load fallback travel times from config.json
@@ -438,13 +530,14 @@ def main():
 
     ec = Easycontrol(CONFIG["easycontrol"])
     ec.init()
-    _last_channel = ec.check_channel()  # baseline for remote-activity detection
+    _ec_mod.set_logger(_log)
 
     client = MQTTClient(
         MQTT_CONFIG['client_id'],
         MQTT_CONFIG['broker'],
         user=MQTT_CONFIG.get('username'),
         password=MQTT_CONFIG.get('password'),
+        keepalive=60,
     )
     client.set_callback(sub_cb)
     client.connect()
@@ -456,7 +549,7 @@ def main():
     # The retained value from the broker is delivered automatically on connect.
 
     # Restore persisted positions; fall back to 50 (unknown) so both OPEN and CLOSE always work
-    send_heartbeat(None)
+    _pub_availability()
     saved = _load_positions()
     for ch in range(1, NUM_CHANNELS + 1):
         pos = saved.get(str(ch), 50) if saved is not None else 50
@@ -475,8 +568,13 @@ def main():
 
     while True:
         try:
+            if _heartbeat_due:
+                _heartbeat_due = False
+                _pub_availability()
             client.check_msg()
+            _process_pending_mqtt_messages()
             _check_timed_moves()
+            _flush_pending_positions()
             _check_external_activity()
         except OSError as e:
             print("Connection error: {}".format(e))
