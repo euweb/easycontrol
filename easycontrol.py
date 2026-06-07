@@ -17,18 +17,10 @@ def set_logger(fn):
 # previously selected channel.
 _SELECT_SETTLE_TIME = 0.5
 
-# The selected channel LED is visible briefly after a SELECT pulse.
-# Poll in small steps so we can detect the new channel without long blocking.
-_SELECT_POLL_INTERVAL = 0.01   # 10 ms between reads
-_SELECT_POLL_ATTEMPTS = 30     # up to 300 ms total polling window
-
 
 class Easycontrol:
 
     CONFIG = None
-
-    # 0 if all channels selected, greater than 0 otherwise
-    selected = None
 
     up_pin = None
     down_pin = None
@@ -196,24 +188,11 @@ class Easycontrol:
         elif all(state == 0 for state in states):
             return -1  # no channel is selected, should not occur
         else:
-            # find the selected channel and return its nubmer
+            # find the selected channel and return its number
             for i, state in enumerate(states):
                 if state == 1:
                     return i+1
         return -1  # catch all, should not occur
-
-    def _poll_selected_after_click(self, prev_channel):
-        """Poll LED inputs for a new channel, ignoring prev_channel (afterglow).
-
-        No initial delay – caller may invoke this both during and after the pulse
-        to maximise the detection window.
-        """
-        for _ in range(_SELECT_POLL_ATTEMPTS):
-            detected = self.check_channel()
-            if detected >= 0 and detected != prev_channel:
-                return detected
-            time.sleep(_SELECT_POLL_INTERVAL)
-        return -1
 
     def select(self, channel):
         if channel is None:
