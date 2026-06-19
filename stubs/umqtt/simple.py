@@ -55,6 +55,11 @@ class MQTTClient:
     def set_callback(self, f):
         self._callback = f
 
+    def set_last_will(self, topic, msg, retain=False, qos=0):
+        if isinstance(msg, str):
+            msg = msg.encode()
+        self._client.will_set(topic, msg, qos=qos, retain=retain)
+
     def connect(self, clean_session=True):
         if self._connected:
             return  # handle duplicate connect() calls gracefully

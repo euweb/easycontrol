@@ -126,7 +126,7 @@ def _flush_pending_positions(force=False):
 
 def _pub_availability():
     topic = MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic']
-    client.publish(topic, HA_CONFIG['payload_available'], qos=1)
+    client.publish(topic, HA_CONFIG['payload_available'], retain=True, qos=1)
 
 
 # ── Timed movement ────────────────────────────────────────────────────────────
@@ -476,7 +476,7 @@ def _mqtt_reconnect():
         # Re-publish current state so HA is up to date.
         client.publish(
             MQTT_CONFIG['basic_topic'] + "/" + HA_CONFIG['availability_topic'],
-            HA_CONFIG['payload_available'], qos=1)
+            HA_CONFIG['payload_available'], retain=True, qos=1)
         for ch in range(1, NUM_CHANNELS + 1):
             if ch in _active_moves:
                 # Channel is mid-move – estimate actual current position.
@@ -539,6 +539,8 @@ def main():
         password=MQTT_CONFIG.get('password'),
         keepalive=60,
     )
+    _avail_topic = MQTT_CONFIG['basic_topic'] + '/' + HA_CONFIG['availability_topic']
+    client.set_last_will(_avail_topic, HA_CONFIG['payload_not_available'], retain=True, qos=1)
     client.set_callback(sub_cb)
     client.connect()
     _log("Connected to {}".format(MQTT_CONFIG['broker']))
