@@ -193,15 +193,25 @@ def _check_timed_moves():
                     final = "closed"
                 else:
                     final = "stopped"
+                # Publish final position FIRST so HA derives state from position
+                # (position_topic overrides state_topic in HA's MQTT cover entity).
+                # Then publish explicit state as confirmation. Also discard any stale
+                # intermediate value that was buffered during the move.
+                _pending_positions.pop(ch, None)
+                _pub_position(ch, target)
                 _pub_state(ch, final)
-                _queue_position(ch, target)
             else:
                 # Buffer current estimated position → flushed periodically to HA
                 elapsed = now - move["start_time"]
                 travel = _get_travel_time(ch)
                 moved = elapsed / travel * 100.0
                 current = max(0, min(100, int(move["start_pos"] + move["direction"] * moved)))
-                _queue_position(ch, current)
+                # Never queue the target value from an intermediate estimate;
+                # int() truncation can produce target (0 or 100) before the
+                # timer fires, which would publish position=0 while state is
+                # still "closing" and confuse HA.
+                if current != move["target"]:
+                    _queue_position(ch, current)
     finally:
         # Always clean up completed channels, even if a publish raised an exception.
         for ch in done:
